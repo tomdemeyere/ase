@@ -53,7 +53,7 @@ PW_NUMBER_OF_ATOMS = r'number of atoms\/cell'
 PW_ALAT = r'celldm\(1\)='
 PW_FIRST_CELL = r'crystal axes:'
 PW_CELL = r'CELL_PARAMETERS'
-PW_FIRST_POSITIONS = r'site n\.\s+atom'
+PW_FIRST_POSITIONS = r'\s+site\s+n\.\s+atom\s+.*\(alat units\)'
 PW_POSITIONS = r'ATOMIC_POSITIONS'
 PW_FORCES = r'Forces acting on atoms'
 PW_STRESS = r'total\s+stress'
@@ -68,7 +68,7 @@ PW_NUMBER_OF_BANDS = r'number of Kohn-Sham states'
 PW_BANDS = r'bands \(ev\):'
 PW_BANDSTRUCTURE = r'End of band structure calculation'
 PW_BLOCK_START = (
-    r"(Program PWSCF|A final scf calculation at the relaxed structure.)"
+    r"(Program PWSCF|A final scf calculation at the relaxed structure.|coordinates at iteration)"
 )
 PW_RESTART = r"Atomic positions from file used, from input discarded"
 PW_BLOCK_START_LSDA = r'the program is checking if it is really the minimum'
@@ -76,6 +76,7 @@ PW_FINAL_COORDS = r'Begin final coordinates'
 PW_BLOCK_END = r'(number of scf cycles|Entering Dynamics:    iteration)'
 PW_TOTEN = r'!\s+total energy'
 PW_VERBOSITY = r"set verbosity\='high'"
+PW_FORCES_SCF = r"Total SCF correction\s+="
 
 
 def read_espresso_out(
@@ -151,6 +152,7 @@ def read_espresso_out(
         PW_TOTEN: [],
         PW_RESTART: [],
         PW_VERBOSITY: [],
+        PW_FORCES_SCF: [],
     }
 
     for idx, line in enumerate(output_lines):
@@ -331,6 +333,11 @@ def read_espresso_out(
 
         return np.hstack(bands).astype(float)
 
+    def parse_scf_force_correction(index: int) -> float:
+        return float(re.findall(float_regex, output_lines[index])[-1]) * units[
+            'Ry'
+        ] / units['Bohr']
+
     properties = list(indexes.keys())
 
     base_properties = [
@@ -340,6 +347,7 @@ def read_espresso_out(
     results_properties = (
         [
             PW_TOTEN,
+            PW_FORCES,
         ]
         if results_required
         else []
@@ -525,6 +533,7 @@ def read_espresso_out(
             PW_FORCES: parse_forces,
             PW_STRESS: parse_stress,
             PW_MAGMOM: parse_magmom,
+            PW_FORCES_SCF: parse_scf_force_correction,
         }
 
         computed_properties = {}
@@ -534,6 +543,16 @@ def read_espresso_out(
                 computed_properties[property_] = properties_left_to_parse[
                     property_
                 ](current_indices[property_][-1])
+
+        forces = computed_properties[PW_FORCES]
+        forces_correction = computed_properties[PW_FORCES_SCF]
+
+        total_force = np.linalg.norm(forces)
+
+        if total_force > 0.1 and forces_correction / total_force > 0.05:
+            raise ValueError(
+                'SCF correction is too large compared to the forces.'
+            )
 
         calc = SinglePointDFTCalculator(
             atoms,
