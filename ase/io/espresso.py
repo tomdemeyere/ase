@@ -36,10 +36,12 @@ from ase.io.espresso_namelist.namelist import Namelist
 from ase.units import create_units
 from ase.utils import deprecated, reader, writer
 
-# Quantum ESPRESSO uses CODATA 2018 internally
 units = create_units('2018')
 
 float_regex = re.compile(r'-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+\-]?\d+)?')
+
+LATE_HOP_RY = 1e-3
+ACC_GATE_RY = 1e-5
 
 ibrav_error_message = (
     'ASE does not support ibrav != 0. Note that with ibrav '
@@ -77,6 +79,11 @@ PW_BLOCK_END = r'(number of scf cycles|Entering Dynamics:    iteration)'
 PW_TOTEN = r'!\s+total energy'
 PW_VERBOSITY = r"set verbosity\='high'"
 PW_FORCES_SCF = r"Total SCF correction\s+="
+PW_SCF_ITER_E = r'^\s+total energy\s+='
+PW_SCF_ACC = r'estimated scf accuracy'
+PW_SCF_CONVERGED = r'convergence has been achieved'
+PW_FERMI_FAIL = r'failed to find Fermi energy'
+PW_TOTAL_MAG = r'total magnetization'
 
 
 def read_espresso_out(
@@ -153,6 +160,11 @@ def read_espresso_out(
         PW_RESTART: [],
         PW_VERBOSITY: [],
         PW_FORCES_SCF: [],
+        PW_SCF_ITER_E: [],
+        PW_SCF_ACC: [],
+        PW_SCF_CONVERGED: [],
+        PW_FERMI_FAIL: [],
+        PW_TOTAL_MAG: [],
     }
 
     for idx, line in enumerate(output_lines):
@@ -337,6 +349,9 @@ def read_espresso_out(
         return float(re.findall(float_regex, output_lines[index])[-1]) * units[
             'Ry'
         ] / units['Bohr']
+
+    def parse_first_float(index: int) -> float:
+        return float(re.findall(float_regex, output_lines[index])[0])
 
     properties = list(indexes.keys())
 
@@ -544,15 +559,55 @@ def read_espresso_out(
                     property_
                 ](current_indices[property_][-1])
 
-        forces = computed_properties[PW_FORCES]
-        forces_correction = computed_properties[PW_FORCES_SCF]
+        forces = computed_properties.get(PW_FORCES)
+        forces_correction = computed_properties.get(PW_FORCES_SCF)
 
-        total_force = np.linalg.norm(forces)
+        if forces is not None and forces_correction is not None:
+            total_force = np.linalg.norm(forces)
 
-        if total_force > 0.1 and forces_correction / total_force > 0.05:
+            if total_force > 0.1 and forces_correction / total_force > 0.05:
+                raise ValueError(
+                    'SCF correction is too large compared to the forces.'
+                )
+            atoms.info['qe_scf_force_correction'] = forces_correction
+
+        # ---- per-frame SCF health checks (pw.x text diagnostics) ----
+        if current_indices[PW_FERMI_FAIL].size:
             raise ValueError(
-                'SCF correction is too large compared to the forces.'
+                'The SCF emitted "failed to find Fermi energy" for this'
+                f' configuration (block {num_block}).'
             )
+
+        scf_converged = bool(current_indices[PW_SCF_CONVERGED].size)
+        atoms.info['qe_scf_converged'] = scf_converged
+        atoms.info['qe_scf_iterations'] = int(
+            current_indices[PW_SCF_ITER_E].size
+        )
+        if current_indices[PW_TOTAL_MAG].size:
+            atoms.info['qe_total_magnetization'] = parse_first_float(
+                current_indices[PW_TOTAL_MAG][-1]
+            )
+
+        if scf_converged:
+            iteration_energies = [
+                parse_first_float(i)
+                for i in current_indices[PW_SCF_ITER_E]
+            ]
+            accuracies = [
+                parse_first_float(i) for i in current_indices[PW_SCF_ACC]
+            ]
+            for i in range(1, len(iteration_energies)):
+                if i - 1 >= len(accuracies):
+                    break
+                jump = abs(
+                    iteration_energies[i] - iteration_energies[i - 1]
+                )
+                if accuracies[i - 1] < ACC_GATE_RY and jump > LATE_HOP_RY:
+                    raise ValueError(
+                        f'Late SCF energy hop of {jump:.1e} Ry after the'
+                        f' cycle reported accuracy {accuracies[i - 1]:.1e}'
+                        f' Ry, yet claimed convergence (block {num_block}).'
+                    )
 
         calc = SinglePointDFTCalculator(
             atoms,
